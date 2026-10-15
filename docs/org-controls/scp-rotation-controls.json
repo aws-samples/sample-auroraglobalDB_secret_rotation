@@ -1,0 +1,50 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyPolicyMutationOnRotationRole",
+      "Effect": "Deny",
+      "Action": [
+        "iam:AttachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:PutRolePermissionsBoundary"
+      ],
+      "Resource": "arn:aws:iam::<account-id>:role/aurora-rotation-lambda-role",
+      "Condition": {
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::<account-id>:role/<cicd-pipeline-role>"
+        }
+      }
+    },
+    {
+      "Sid": "DenyModifyDBClusterExceptRotationRole",
+      "Effect": "Deny",
+      "Action": "rds:ModifyDBCluster",
+      "Resource": [
+        "arn:aws:rds:us-east-1:<account-id>:cluster:<primary-cluster-id>",
+        "arn:aws:rds:us-east-2:<account-id>:cluster:<secondary-cluster-id>"
+      ],
+      "Condition": {
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::<account-id>:role/aurora-rotation-lambda-role"
+        }
+      }
+    },
+    {
+      "Sid": "DenyLambdaCodeChangesForHumans",
+      "Effect": "Deny",
+      "Action": [
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:AddLayerVersionPermission"
+      ],
+      "Resource": "arn:aws:lambda:*:<account-id>:function:aurora-master-password-rotation",
+      "Condition": {
+        "ArnNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::<account-id>:role/<cicd-pipeline-role>"
+        }
+      }
+    }
+  ]
+}

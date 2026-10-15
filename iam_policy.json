@@ -1,0 +1,67 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SecretsManagerAccess",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:UpdateSecretVersionStage",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-east-1:<account-id>:secret:<your-secret-name>*"
+    },
+    {
+      "Sid": "KMSDecryptForSecret",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "arn:aws:kms:us-east-1:<account-id>:key/<cmk-key-id>",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "secretsmanager.us-east-1.amazonaws.com"
+        }
+      }
+    },
+    {
+      "Sid": "RDSModifyClusterBothRegions",
+      "Effect": "Allow",
+      "Action": [
+        "rds:ModifyDBCluster",
+        "rds:DescribeDBClusters"
+      ],
+      "Resource": [
+        "arn:aws:rds:us-east-1:<account-id>:cluster:<primary-cluster-id>",
+        "arn:aws:rds:us-east-2:<account-id>:cluster:<secondary-cluster-id>"
+      ]
+    },
+    {
+      "Sid": "RDSDescribeGlobalClusters",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DescribeGlobalClusters"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-1:<account-id>:log-group:/aws/lambda/aurora-master-password-rotation:*"
+    },
+    {
+      "Sid": "GetRandomPassword",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetRandomPassword"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

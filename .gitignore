@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Packaging / build artifacts
+*.zip
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,760 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Failover-aware master user password rotation for an Amazon Aurora MySQL
+  Global Database. Hardened reference deployment (sample code, non-production).
+
+# ---------------------------------------------------------------------------
+# SAMPLE CODE - NOT FOR PRODUCTION USE
+#
+# This is sample code, for non-production usage. You should work with your
+# security and legal teams to meet your organizational security, regulatory,
+# and compliance requirements before deployment.
+#
+# This template provisions the *rotation solution* only. Account-wide security
+# baselines (AWS CloudTrail, Amazon GuardDuty, AWS Security Hub) are documented
+# as prerequisites in docs/org-controls/ and are intentionally NOT created here,
+# because they are typically enabled once per account/organization and would
+# conflict with an existing baseline.
+# ---------------------------------------------------------------------------
+
+Parameters:
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    Description: Primary AWS Region that hosts the writer at deploy time.
+
+  SecondaryRegion:
+    Type: String
+    Default: us-east-2
+    Description: Secondary (DR) AWS Region for the global database.
+
+  GlobalClusterId:
+    Type: String
+    Default: aurora-global-test-cluster
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9-]{1,62}$'
+    Description: Aurora global cluster identifier (used by the rotation Lambda).
+
+  PrimaryClusterId:
+    Type: String
+    Default: aurora-global-primary-cluster
+    Description: DB cluster identifier in the primary Region.
+
+  SecondaryClusterId:
+    Type: String
+    Default: aurora-global-secondary-cluster
+    Description: DB cluster identifier in the secondary Region.
+
+  SecretName:
+    Type: String
+    Default: aurora-global-master-cred
+    Description: Name of the Secrets Manager secret holding the master credentials.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC in which to run the rotation Lambda and interface endpoints.
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      Private subnets (no default route to an internet gateway) for the Lambda
+      and the interface VPC endpoints.
+
+  PermissionsBoundaryArn:
+    Type: String
+    Description: >-
+      ARN of the IAM permissions boundary policy to attach to the execution
+      role (see docs/org-controls/). Enforces the deny on iam:*, organizations:*,
+      and account:* (M4).
+    AllowedPattern: '^arn:aws:iam::[0-9]{12}:policy/.+$'
+
+  OnCallEmail:
+    Type: String
+    Description: Email address subscribed to rotation-failure alerts (M21).
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+
+  SecurityAuditRoleArn:
+    Type: String
+    Description: >-
+      ARN of the security audit role permitted to read the rotation log group.
+      All other principals are denied logs:GetLogEvents by the log group's
+      resource policy (M15).
+    AllowedPattern: '^arn:aws:iam::[0-9]{12}:role/.+$'
+
+Resources:
+
+  # -------------------------------------------------------------------------
+  # M7 - Customer managed KMS key for the secret
+  # -------------------------------------------------------------------------
+  SecretEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for the Aurora global master credential secret.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountRootAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowSecretsManagerServiceViaService
+            Effect: Allow
+            Principal:
+              Service: secretsmanager.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:CreateGrant
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 'secretsmanager.${PrimaryRegion}.amazonaws.com'
+          # The rotation role is granted kms:Decrypt/GenerateDataKey in its own
+          # identity policy (see RotationLambdaExecutionRole), scoped by the
+          # same kms:ViaService condition. Granting it there rather than in this
+          # key policy avoids a circular dependency between the key and the role
+          # while preserving least privilege: the key is usable only through
+          # Secrets Manager in the primary Region.
+
+  SecretEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${SecretName}-cmk'
+      TargetKeyId: !Ref SecretEncryptionKey
+
+  # -------------------------------------------------------------------------
+  # M15 - Explicit log group with CMK encryption and retention
+  # -------------------------------------------------------------------------
+  RotationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/aurora-master-password-rotation
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt LogsEncryptionKey.Arn
+
+  # M15 - Deny reading log events to everyone except the security audit role.
+  # CloudWatch Logs resource policies apply per account/Region; this restricts
+  # logs:GetLogEvents on the rotation log group.
+  RotationLogGroupResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: aurora-rotation-log-read-restriction
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyLogReadExceptAuditRole",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": ["logs:GetLogEvents", "logs:FilterLogEvents"],
+              "Resource": "arn:aws:logs:${PrimaryRegion}:${AWS::AccountId}:log-group:/aws/lambda/aurora-master-password-rotation:*",
+              "Condition": {
+                "ArnNotEquals": {
+                  "aws:PrincipalArn": "${SecurityAuditRoleArn}"
+                }
+              }
+            }
+          ]
+        }
+
+  LogsEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for the rotation Lambda log group.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountRootAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${PrimaryRegion}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${PrimaryRegion}:${AWS::AccountId}:log-group:/aws/lambda/aurora-master-password-rotation'
+
+  # M15 - Alarm if a log event ever contains a plaintext secret marker
+  SecretLeakMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref RotationLogGroup
+      FilterPattern: '?password ?SecretString'
+      MetricTransformations:
+        - MetricNamespace: AuroraRotation/Security
+          MetricName: PotentialSecretLeak
+          MetricValue: '1'
+          DefaultValue: 0
+
+  SecretLeakAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Fires if the rotation log group emits a password/SecretString token.
+      Namespace: AuroraRotation/Security
+      MetricName: PotentialSecretLeak
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref RotationAlertTopic
+
+  # -------------------------------------------------------------------------
+  # M9 - Lambda code signing via AWS Signer
+  # -------------------------------------------------------------------------
+  RotationSigningProfile:
+    Type: AWS::Signer::SigningProfile
+    Properties:
+      PlatformId: AWSLambda-SHA384-ECDSA
+
+  RotationCodeSigningConfig:
+    Type: AWS::Lambda::CodeSigningConfig
+    Properties:
+      Description: Enforce signed code for the rotation Lambda.
+      AllowedPublishers:
+        SigningProfileVersionArns:
+          - !GetAtt RotationSigningProfile.ProfileVersionArn
+      CodeSigningPolicies:
+        UntrustedArtifactOnDeployment: Enforce
+
+  # -------------------------------------------------------------------------
+  # M12 - Security groups for the Lambda and the interface endpoints.
+  # Both groups declare explicit egress rules (below) so outbound traffic is
+  # not left at the security-group default of allow-all. The two groups
+  # reference each other, so the cross-referencing rules are declared as
+  # standalone resources to avoid a circular dependency.
+  # -------------------------------------------------------------------------
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Rotation Lambda - outbound HTTPS to VPC endpoints only.
+      VpcId: !Ref VpcId
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface VPC endpoints - allow HTTPS from the Lambda SG.
+      VpcId: !Ref VpcId
+
+  LambdaEgressToEndpoints:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref EndpointSecurityGroup
+      Description: HTTPS to interface VPC endpoints.
+
+  EndpointIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: HTTPS from the rotation Lambda.
+
+  # Explicit egress for the endpoint SG. Without an explicit egress rule, a
+  # security group defaults to allowing ALL outbound traffic. Interface
+  # endpoint network interfaces only respond to inbound requests, so egress is
+  # restricted to HTTPS back to the Lambda security group rather than left at
+  # the implicit allow-all default.
+  EndpointEgressToLambda:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref EndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: HTTPS responses to the rotation Lambda.
+
+  # M12 - Interface endpoints so the VPC-bound Lambda reaches AWS APIs privately.
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${PrimaryRegion}.secretsmanager'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  RdsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${PrimaryRegion}.rds'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${PrimaryRegion}.logs'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref PrivateSubnetIds
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+
+  # -------------------------------------------------------------------------
+  # M3 / M4 - Execution role with permissions boundary and least privilege
+  # -------------------------------------------------------------------------
+  RotationLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Ref PermissionsBoundaryArn
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      # Permissions are split across focused managed policies to keep each
+      # policy's complexity low (cfn_nag W76 / SPCM) while preserving least
+      # privilege.
+      ManagedPolicyArns:
+        - !Ref RotationSecretsPolicy
+        - !Ref RotationRdsPolicy
+        - !Ref RotationRuntimePolicy
+
+  # Secrets Manager + KMS access for the rotation workflow.
+  RotationSecretsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SecretsManagerAccess
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+              - secretsmanager:UpdateSecretVersionStage
+              - secretsmanager:DescribeSecret
+            Resource: !Sub 'arn:aws:secretsmanager:${PrimaryRegion}:${AWS::AccountId}:secret:${SecretName}*'
+          - Sid: GetRandomPassword
+            Effect: Allow
+            Action: secretsmanager:GetRandomPassword
+            Resource: '*'
+          - Sid: KMSKeyAccess
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource:
+              - !GetAtt SecretEncryptionKey.Arn
+              - !GetAtt DlqEncryptionKey.Arn
+              - !GetAtt LambdaEnvEncryptionKey.Arn
+
+  # RDS access - writer discovery and password change in both Regions.
+  RotationRdsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RDSModifyClusterBothRegions
+            Effect: Allow
+            Action:
+              - rds:ModifyDBCluster
+              - rds:DescribeDBClusters
+            Resource:
+              - !Sub 'arn:aws:rds:${PrimaryRegion}:${AWS::AccountId}:cluster:${PrimaryClusterId}'
+              - !Sub 'arn:aws:rds:${SecondaryRegion}:${AWS::AccountId}:cluster:${SecondaryClusterId}'
+          - Sid: RDSDescribeGlobalClusters
+            Effect: Allow
+            Action: rds:DescribeGlobalClusters
+            Resource: '*'
+
+  # Runtime needs - logs, VPC ENIs, and the dead-letter queue.
+  RotationRuntimePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !GetAtt RotationLogGroup.Arn
+          - Sid: VpcNetworkInterfaces
+            Effect: Allow
+            Action:
+              - ec2:CreateNetworkInterface
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DeleteNetworkInterface
+            # These EC2 ENI actions do not support resource-level scoping for
+            # all sub-operations, so a region condition constrains them rather
+            # than an unbounded "*" (W11/CKV_AWS_111).
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref PrimaryRegion
+          - Sid: DeadLetterQueueSend
+            Effect: Allow
+            Action: sqs:SendMessage
+            Resource: !GetAtt RotationDeadLetterQueue.Arn
+
+  # -------------------------------------------------------------------------
+  # Rotation Lambda (VPC-bound, signed, explicit log group)
+  # -------------------------------------------------------------------------
+  RotationFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: RotationLogGroup
+    Properties:
+      FunctionName: aurora-master-password-rotation
+      CodeUri: src/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 128
+      # Rotation is low-volume and strictly serial per secret; cap concurrency
+      # to bound blast radius and satisfy concurrency-limit checks (W92).
+      ReservedConcurrentExecutions: 2
+      CodeSigningConfigArn: !Ref RotationCodeSigningConfig
+      Role: !GetAtt RotationLambdaExecutionRole.Arn
+      # Encrypt environment variables with a customer managed key (CKV_AWS_173).
+      KmsKeyArn: !GetAtt LambdaEnvEncryptionKey.Arn
+      Environment:
+        Variables:
+          GLOBAL_CLUSTER_ID: !Ref GlobalClusterId
+      # Send failed asynchronous invocations to a dead-letter queue (CKV_AWS_116).
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt RotationDeadLetterQueue.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref PrivateSubnetIds
+
+  # Dead-letter queue for failed asynchronous rotation invocations.
+  RotationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: aurora-rotation-dlq
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref DlqEncryptionKey
+      KmsDataKeyReusePeriodSeconds: 300
+
+  # CMK used to encrypt the dead-letter queue at rest (W48/CKV_AWS_27).
+  DlqEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for the rotation dead-letter queue.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountRootAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowLambdaServiceUseOfKey
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # CMK used to encrypt the Lambda's environment variables at rest.
+  LambdaEnvEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for the rotation Lambda environment variables.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountRootAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowLambdaServiceDecrypt
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # Allow the execution role to decrypt its own environment variables.
+  # (Granted in the role's identity policy to avoid a key<->role cycle.)
+
+  # Allow Secrets Manager to invoke the rotation function.
+  RotationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RotationFunction
+      Action: lambda:InvokeFunction
+      Principal: secretsmanager.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  # -------------------------------------------------------------------------
+  # Secret + M6 resource policy + M7 CMK + rotation schedule
+  # -------------------------------------------------------------------------
+  MasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Ref SecretName
+      Description: Master user credentials for the Aurora global database.
+      KmsKeyId: !Ref SecretEncryptionKey
+      # NOTE: seed the secret value out-of-band (file:// + CLI) or via a
+      # controlled pipeline; do not place a real password in this template.
+
+  # M6 - Explicit deny for every principal except the rotation execution role.
+  MasterSecretResourcePolicy:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref MasterSecret
+      ResourcePolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyAllExceptRotationRole
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:PutSecretValue
+            Resource: '*'
+            Condition:
+              StringNotEquals:
+                'aws:PrincipalArn': !GetAtt RotationLambdaExecutionRole.Arn
+
+  SecretRotationSchedule:
+    Type: AWS::SecretsManager::RotationSchedule
+    DependsOn: RotationInvokePermission
+    Properties:
+      SecretId: !Ref MasterSecret
+      RotationLambdaARN: !GetAtt RotationFunction.Arn
+      RotationRules:
+        AutomaticallyAfterDays: 30
+
+  # -------------------------------------------------------------------------
+  # M21 - Rotation-failure alerting
+  # -------------------------------------------------------------------------
+  RotationAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: aurora-rotation-alerts
+      KmsMasterKeyId: alias/aws/sns
+
+  RotationAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref RotationAlertTopic
+      Protocol: email
+      Endpoint: !Ref OnCallEmail
+
+  RotationErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Rotation Lambda reported one or more errors.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RotationFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref RotationAlertTopic
+
+  # M21 - Secrets Manager RotationFailed event -> SNS
+  RotationFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: aurora-rotation-failed
+      Description: Route Secrets Manager RotationFailed events to on-call.
+      EventPattern:
+        source:
+          - aws.secretsmanager
+        detail-type:
+          - AWS Service Event via CloudTrail
+        detail:
+          eventName:
+            - RotationFailed
+      State: ENABLED
+      Targets:
+        - Arn: !Ref RotationAlertTopic
+          Id: rotation-failed-sns
+
+  # -------------------------------------------------------------------------
+  # M19 - Alert on ModifyDBCluster not originating from the rotation role
+  # -------------------------------------------------------------------------
+  UnexpectedModifyDBClusterRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: aurora-unexpected-modifydbcluster
+      Description: >-
+        Alert on any rds:ModifyDBCluster call not made by the rotation role.
+        (Org-level SCP denial is applied separately - see docs/org-controls/.)
+      EventPattern:
+        source:
+          - aws.rds
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - rds.amazonaws.com
+          eventName:
+            - ModifyDBCluster
+          userIdentity:
+            sessionContext:
+              sessionIssuer:
+                arn:
+                  - anything-but:
+                      - !GetAtt RotationLambdaExecutionRole.Arn
+      State: ENABLED
+      Targets:
+        - Arn: !Ref RotationAlertTopic
+          Id: unexpected-modify-sns
+
+  # -------------------------------------------------------------------------
+  # M16 - Alert on GetSecretValue from an unexpected principal
+  # -------------------------------------------------------------------------
+  UnexpectedSecretAccessRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: aurora-unexpected-getsecretvalue
+      Description: >-
+        Alert on secretsmanager:GetSecretValue for the master secret by any
+        principal other than the rotation role. (Enable GuardDuty Secrets
+        Manager protection and Security Hub at the account level - see
+        docs/org-controls/.)
+      EventPattern:
+        source:
+          - aws.secretsmanager
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - secretsmanager.amazonaws.com
+          eventName:
+            - GetSecretValue
+          requestParameters:
+            secretId:
+              - !Ref SecretName
+          userIdentity:
+            sessionContext:
+              sessionIssuer:
+                arn:
+                  - anything-but:
+                      - !GetAtt RotationLambdaExecutionRole.Arn
+      State: ENABLED
+      Targets:
+        - Arn: !Ref RotationAlertTopic
+          Id: unexpected-access-sns
+
+  # -------------------------------------------------------------------------
+  # M13 - Alert on configuration/code changes to the rotation function
+  # -------------------------------------------------------------------------
+  RotationFunctionChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: aurora-rotation-function-changed
+      Description: >-
+        Alert on lambda:UpdateFunctionConfiguration or UpdateFunctionCode calls
+        against the rotation function. (Human changes should be denied via SCP -
+        see docs/org-controls/; this rule provides detection.)
+      EventPattern:
+        source:
+          - aws.lambda
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - lambda.amazonaws.com
+          eventName:
+            - UpdateFunctionConfiguration20150331v2
+            - UpdateFunctionConfiguration
+            - UpdateFunctionCode20150331v2
+            - UpdateFunctionCode
+          requestParameters:
+            functionName:
+              - aurora-master-password-rotation
+      State: ENABLED
+      Targets:
+        - Arn: !Ref RotationAlertTopic
+          Id: function-changed-sns
+
+  # Allow EventBridge rules to publish to the SNS topic.
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref RotationAlertTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref RotationAlertTopic
+
+Outputs:
+  RotationFunctionArn:
+    Description: ARN of the rotation Lambda.
+    Value: !GetAtt RotationFunction.Arn
+
+  SecretArn:
+    Description: ARN of the master credential secret.
+    Value: !Ref MasterSecret
+
+  SecretCmkArn:
+    Description: ARN of the customer managed KMS key encrypting the secret.
+    Value: !GetAtt SecretEncryptionKey.Arn
+
+  AlertTopicArn:
+    Description: SNS topic for rotation-failure and security alerts.
+    Value: !Ref RotationAlertTopic
