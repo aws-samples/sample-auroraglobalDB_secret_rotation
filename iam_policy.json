@@ -44,7 +44,7 @@
       "Action": [
         "rds:DescribeGlobalClusters"
       ],
-      "Resource": "*"
+      "Resource": "arn:aws:rds::<account-id>:global-cluster:<global-cluster-id>"
     },
     {
       "Sid": "CloudWatchLogs",

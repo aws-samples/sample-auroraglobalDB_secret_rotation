@@ -90,8 +90,9 @@ gated publication):
 
 - **Least-privilege IAM** — execution-role permissions in `iam_policy.json` are
   scoped to the specific secret, cluster ARNs (both Regions), and log group.
-  `rds:DescribeGlobalClusters` and `secretsmanager:GetRandomPassword` do not
-  support resource-level permissions, so those statements use `Resource: "*"`.
+  `rds:DescribeGlobalClusters` is scoped to the global cluster ARN.
+  `secretsmanager:GetRandomPassword` does not act on any resource, so it uses
+  `Resource: "*"`.
 - **Scoped trust policy** — `iam_trust_policy.json` restricts assumption with an
   `aws:SourceAccount` condition.
 - **Customer managed KMS key** — the secret is encrypted with a dedicated CMK
