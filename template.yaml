@@ -395,7 +395,9 @@ Resources:
           - Sid: RDSDescribeGlobalClusters
             Effect: Allow
             Action: rds:DescribeGlobalClusters
-            Resource: '*'
+            # Scoped to the specific global cluster. rds:DescribeGlobalClusters
+            # supports the global-cluster resource type, which is Region-less.
+            Resource: !Sub 'arn:aws:rds::${AWS::AccountId}:global-cluster:${GlobalClusterId}'
 
   # Runtime needs - logs, VPC ENIs, and the dead-letter queue.
   RotationRuntimePolicy:
