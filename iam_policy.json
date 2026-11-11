@@ -10,7 +10,7 @@
         "secretsmanager:UpdateSecretVersionStage",
         "secretsmanager:DescribeSecret"
       ],
-      "Resource": "arn:aws:secretsmanager:us-east-1:<account-id>:secret:<your-secret-name>*"
+      "Resource": "arn:aws:secretsmanager:us-east-1:<account-id>:secret:<your-secret-name>-??????"
     },
     {
       "Sid": "KMSDecryptForSecret",
@@ -54,14 +54,6 @@
         "logs:PutLogEvents"
       ],
       "Resource": "arn:aws:logs:us-east-1:<account-id>:log-group:/aws/lambda/aurora-master-password-rotation:*"
-    },
-    {
-      "Sid": "GetRandomPassword",
-      "Effect": "Allow",
-      "Action": [
-        "secretsmanager:GetRandomPassword"
-      ],
-      "Resource": "*"
     }
   ]
 }

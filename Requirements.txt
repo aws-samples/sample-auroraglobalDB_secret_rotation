@@ -17,8 +17,9 @@
 #     --hash=sha256:2d918b02db88d27a75b48275e6fb2506e9adf810f6c5b2e5b0b643d3d8f2e2b0
 
 # ---------------------------------------------------------------------------
-# Optional: real DB-connectivity test in testSecret (see lambda_function.py).
-# Requires bundling as a Lambda layer.
+# Optional: real DB-connectivity test in testSecret (see "Validation and
+# failure handling" in README.md). Bundle with the function (for example,
+# src/requirements.txt for `sam build`) or as a Lambda layer.
 # ---------------------------------------------------------------------------
 # pymysql==1.1.1 \
 #     --hash=sha256:e127611aaf2b417403c60bf4dc570124aeb4a57f5f37b8e95ae399a42f904cd0
