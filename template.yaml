@@ -362,11 +362,9 @@ Resources:
               - secretsmanager:PutSecretValue
               - secretsmanager:UpdateSecretVersionStage
               - secretsmanager:DescribeSecret
-            Resource: !Sub 'arn:aws:secretsmanager:${PrimaryRegion}:${AWS::AccountId}:secret:${SecretName}*'
-          - Sid: GetRandomPassword
-            Effect: Allow
-            Action: secretsmanager:GetRandomPassword
-            Resource: '*'
+            # Exact ARN of the secret created by this stack (includes the
+            # six-character suffix), so no other secret can match.
+            Resource: !Ref MasterSecret
           - Sid: KMSKeyAccess
             Effect: Allow
             Action:
@@ -441,7 +439,9 @@ Resources:
       CodeUri: src/
       Handler: lambda_function.lambda_handler
       Runtime: python3.12
-      Timeout: 60
+      # testSecret waits for RDS to apply the credential change and keeps time
+      # in reserve for a rollback, so allow more than the 60-second minimum.
+      Timeout: 120
       MemorySize: 128
       # Rotation is low-volume and strictly serial per secret; cap concurrency
       # to bound blast radius and satisfy concurrency-limit checks (W92).
@@ -453,7 +453,10 @@ Resources:
       Environment:
         Variables:
           GLOBAL_CLUSTER_ID: !Ref GlobalClusterId
-      # Send failed asynchronous invocations to a dead-letter queue (CKV_AWS_116).
+      # Dead-letter queue for failed *asynchronous* invocations (CKV_AWS_116).
+      # It receives nothing for synchronous invocations, so it is a secondary
+      # signal only. RotationErrorAlarm and RotationFailedRule are the primary
+      # rotation-failure alerts.
       DeadLetterQueue:
         Type: SQS
         TargetArn: !GetAtt RotationDeadLetterQueue.Arn
@@ -573,6 +576,10 @@ Resources:
     Properties:
       SecretId: !Ref MasterSecret
       RotationLambdaARN: !GetAtt RotationFunction.Arn
+      # The secret is created empty and seeded out-of-band, so do not rotate at
+      # stack creation (there is no AWSCURRENT value yet). After seeding, start
+      # the first rotation with: aws secretsmanager rotate-secret --secret-id <arn>
+      RotateImmediatelyOnUpdate: false
       RotationRules:
         AutomaticallyAfterDays: 30
 
@@ -583,7 +590,36 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: aurora-rotation-alerts
-      KmsMasterKeyId: alias/aws/sns
+      # CloudWatch alarms and EventBridge can publish to an encrypted topic only
+      # if the key policy lets their service principals use the key. The AWS
+      # managed key (alias/aws/sns) policy cannot be changed, so use a CMK.
+      KmsMasterKeyId: !Ref AlertTopicEncryptionKey
+
+  # CMK for the alert topic, usable by CloudWatch alarms and EventBridge.
+  AlertTopicEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for the aurora-rotation-alerts SNS topic.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableAccountRootAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowAlarmAndEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudwatch.amazonaws.com
+                - events.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
 
   RotationAlertSubscription:
     Type: AWS::SNS::Subscription

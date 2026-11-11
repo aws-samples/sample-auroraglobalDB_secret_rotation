@@ -9,7 +9,6 @@
         "secretsmanager:PutSecretValue",
         "secretsmanager:UpdateSecretVersionStage",
         "secretsmanager:DescribeSecret",
-        "secretsmanager:GetRandomPassword",
         "kms:Decrypt",
         "kms:GenerateDataKey",
         "rds:ModifyDBCluster",
