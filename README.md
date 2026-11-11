@@ -60,6 +60,7 @@ sam deploy --guided \
     PrimaryClusterId=<your-primary-cluster-id> \
     SecondaryClusterId=<your-secondary-cluster-id> \
     SecretName=aurora-global-master-cred \
+    MasterUsername=admin \
     VpcId=<your-vpc-id> \
     PrivateSubnetIds=<subnet-a>,<subnet-b> \
     PermissionsBoundaryArn=arn:aws:iam::<account-id>:policy/<boundary-name> \
@@ -70,16 +71,29 @@ Before deploying, create the permissions boundary from
 `docs/org-controls/permissions-boundary.json` (see M4 below); the template
 requires its ARN.
 
-The template creates the secret **empty** and does not rotate it at creation.
-After the stack is deployed, seed the secret with the cluster's current master
-credentials (use `file://`, never an inline password), then start the first
-rotation:
+**The deployment rotates the master password immediately.** The secret's
+resource policy (M6) denies writing the secret to everyone except the rotation
+role, so you do not seed it with the current password. Instead, the template
+creates the secret with a random placeholder password, and the rotation that
+starts at deployment sets a new master password on the writer cluster. The
+previous master password stops working at that point. Deploy while the writer
+is in the primary Region, and plan for the password change like any other
+rotation.
+
+Until that first rotation succeeds, the secret does not hold a working
+password. Confirm it completed (`LastRotatedDate` is set and the RDS events
+show `Reset master credentials`):
 
 ```bash
-aws secretsmanager put-secret-value --secret-id <SecretArn output> \
-  --secret-string file:///tmp/aurora-cred.json --region us-east-1
-aws secretsmanager rotate-secret --secret-id <SecretArn output> --region us-east-1
+aws secretsmanager describe-secret --secret-id <SecretArn output> --region us-east-1 \
+  --query '{LastRotated:LastRotatedDate,Versions:VersionIdsToStages}'
+aws rds describe-events --source-type db-cluster \
+  --source-identifier <your-primary-cluster-id> --duration 60 --region us-east-1
 ```
+
+If it did not complete, check the function's log group and the
+`RotationFailed` alert, fix the cause, and run
+`aws secretsmanager rotate-secret --secret-id <SecretArn output> --region us-east-1`.
 
 **Network path to the secondary Region (PCSR M12).** The Lambda security group
 allows outbound HTTPS only to interface VPC endpoints, and the template creates
