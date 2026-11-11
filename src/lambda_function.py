@@ -257,22 +257,24 @@ def set_secret(sm_client, arn, token, context=None):
 
     deadline = _deadline(context)
     secret_dict = _get_pending(sm_client, arn, token)
-    cluster_id = secret_dict['dbClusterIdentifier']
-    writer_region = secret_dict['writerRegion']
 
     # Check the writer BEFORE changing anything. If it moved since createSecret
     # (or since an earlier attempt of this same rotation), abandon the rotation.
     # The rollback is a no-op in effect when nothing was applied yet, and it
     # restores consistency if an earlier attempt already applied the change.
     current_writer = discover_writer_cluster()
-    if current_writer['cluster_id'] != cluster_id:
+    if not _pending_targets(secret_dict, current_writer):
         _abort_rotation(
             sm_client, arn, token,
-            f"setSecret: FAILOVER DETECTED. AWSPENDING targets {cluster_id} but the "
-            f"current writer is {current_writer['cluster_id']}.",
+            f"setSecret: FAILOVER DETECTED. AWSPENDING was created for a different "
+            f"writer; the current writer is {current_writer['cluster_id']}.",
             deadline,
         )
 
+    # From here on, identify the cluster by the values RDS returned (equal to the
+    # ones in AWSPENDING, as checked above), so nothing read from the secret is
+    # logged.
+    cluster_id, writer_region = current_writer['cluster_id'], current_writer['region']
     rds_client = _client('rds', writer_region)
     try:
         rds_client.modify_db_cluster(
@@ -302,18 +304,18 @@ def test_secret(sm_client, arn, token, context=None):
 
         # Verify the writer hasn't changed mid-rotation (failover during rotation).
         current_writer = discover_writer_cluster()
-        if current_writer['cluster_id'] != secret_dict['dbClusterIdentifier']:
+        if not _pending_targets(secret_dict, current_writer):
             raise RotationAbortedError(
-                f"FAILOVER DETECTED. AWSPENDING targets {secret_dict['dbClusterIdentifier']} "
-                f"but the current writer is {current_writer['cluster_id']}."
+                f"FAILOVER DETECTED. AWSPENDING was created for a different writer; "
+                f"the current writer is {current_writer['cluster_id']}."
             )
 
         # Confirm that RDS finished applying the change on the writer: the
         # cluster is available and no master credential change is pending.
         # This is control-plane validation; it does not open a DB connection.
         _wait_for_credential_change_applied(
-            secret_dict['dbClusterIdentifier'],
-            secret_dict['writerRegion'],
+            current_writer['cluster_id'],
+            current_writer['region'],
             deadline - ROLLBACK_RESERVE_SECONDS,
         )
     except Exception as e:  # noqa: BLE001 - any failure here must roll back
@@ -321,8 +323,14 @@ def test_secret(sm_client, arn, token, context=None):
 
     logger.info(
         f"testSecret: Passed. Writer confirmed and credential change applied: "
-        f"{secret_dict['dbClusterIdentifier']} in {secret_dict['writerRegion']}"
+        f"{current_writer['cluster_id']} in {current_writer['region']}"
     )
+
+
+def _pending_targets(secret_dict, writer):
+    """True if the AWSPENDING version was created for this writer cluster."""
+    return (secret_dict.get('dbClusterIdentifier') == writer['cluster_id']
+            and secret_dict.get('writerRegion') == writer['region'])
 
 
 def finish_secret(sm_client, arn, token):
@@ -367,9 +375,8 @@ def _validate_secret_fields(secret_dict):
         'username', 'password', 'host', 'port', 'engine',
         'dbClusterIdentifier', 'writerRegion', 'globalClusterIdentifier',
     ]
-    missing = [f for f in required_fields if f not in secret_dict]
-    if missing:
-        raise ValueError(f"AWSPENDING is missing {len(missing)} required field(s)")
+    if any(f not in secret_dict for f in required_fields):
+        raise ValueError("AWSPENDING is missing a required field")
     if len(secret_dict['password']) < 8:
         raise ValueError("generated credential is shorter than 8 characters")
 
